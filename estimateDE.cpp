@@ -2,10 +2,14 @@
  * Original model applying the DE model to individual sets of samples independently.
  * One set of samples == 1 sample from each replicate of each condition.
  */
-#include<algorithm>
-#include<cmath>
-#include<fstream>
-#include<sstream>
+#include <iostream>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include "boost/random/gamma_distribution.hpp"
 #include "boost/random/mersenne_twister.hpp"
 #include "boost/random/normal_distribution.hpp"
@@ -35,7 +39,8 @@ bool initializeOutputFile(long C, long M, long N, const ArgumentParser &args, of
 void getParams(double expr,const vector<paramT> &params, paramT *par);
 // Read transcript m into tr and prepare mu_0 and mu_00, cond does not really change.
 void readNextTranscript(long m, long C, long N, Conditions *cond, const vector<paramT> &params, vector<vector<vector<double> > > *tr, vector<paramT> *curParams, double *mu_00);
-
+// Compute 
+float probFC(vector<double> x, vector<double> y, double logThreshold);
 }
 
 extern "C" int estimateDE(int *argc,char* argv[]){
@@ -50,6 +55,7 @@ string programDescription =
    args.addOptionS("p","parameters","parFileName",1,"File containing estimated hyperparameters.");
    args.addOptionB("s","samples","samples",0,"Produce samples of condition mean expression apart from PPLR and confidence.");
    args.addOptionD("l","lambda0","lambda0",0,"Parameter lambda_0.",LAMBDA_0);
+   args.addOptionD("t","logFCThreshold","logFCThreshold",0,"Compute a posterior probability (for each transcript) that there was a change as big as specified by the parameter. Does not output anything if left as default.", 0);
    args.addOptionD("","confidenceInterval","cf",0,"Percentage for confidence intervals.", 95);
    args.addOptionS("","norm","normalization",0,"Normalization constants for each input file provided as comma separated list of doubles (e.g. 1.0017,1.0,0.9999 ).");
    args.addOptionL("","seed","seed",0,"Random initialization seed.");
@@ -86,6 +92,7 @@ string programDescription =
    long c,c2,m,n,r;
    double prec,var,sum,sumSq,alpha,beta,betaPar,mu_00,normMu;
    double lambda0 = args.getD("lambda0");
+   double fcThreshold = args.getD("logFCThreshold");
    long RC;
    MyTimer timer;
    boost::random::mt11213b rng_mt(ns_misc::getSeed(args));
@@ -93,7 +100,7 @@ string programDescription =
    typedef boost::random::gamma_distribution<long double>::param_type gDP;
    boost::random::normal_distribution<long double> normalDistribution;
    typedef boost::random::normal_distribution<long double>::param_type nDP;
-   double log2FC, pplr, ciLow, ciHigh;
+   double log2FC, pplr, fcProb, ciLow, ciHigh;
    vector<double> difs(N);
    // }}}
 
@@ -151,8 +158,19 @@ string programDescription =
             for(n=0;n<N;n++)
                if(samples[c2][n] > samples[c][n])pplr+=1;
             pplr/=N;
+            // printf("PPLR: %f > ", pplr);
             outF<<pplr<<" ";
          }
+      }
+      // Compute a posterior probability of FC (if threshold is greater than 0)
+      if(fcThreshold>0.0){
+         for(c=0;c<C;c++){
+            for(c2=c+1;c2<C;c2++){
+               fcProb = 0;
+               fcProb = ns_estimateDE::probFC(samples[c], samples[c2], fcThreshold);
+               outF<<fcProb<<" ";
+            }
+         } 
       }
       // }}}
       // Calculate log2FC; write log2FC and CIs for each pair of conditions. {{{
@@ -200,6 +218,42 @@ int main(int argc,char* argv[]){
 #endif
 
 namespace ns_estimateDE {
+
+float probFC(vector<double> x, vector<double> y, double logThreshold)
+{
+   float stat = 0;
+
+   sort( x.begin(), x.end() );
+   sort( y.begin(), y.end() );
+
+   // printf("X[ %f , %f , %f ] ", x[0], x[500], x[999]);
+   // printf("Y[ %f , %f , %f ]  =>  ", y[0], y[500], y[999]);
+
+   for (vector<double>::iterator it = x.begin(); it != x.end(); it++){
+      vector<double>::iterator lowIt, upIt;
+
+      float tmp = 0;
+
+      double lowVal = *it - logThreshold;
+      double upVal  = *it + logThreshold;
+
+      lowIt = lower_bound(y.begin(), y.end(), lowVal);
+      upIt  = upper_bound(y.begin(), y.end(), upVal); 
+
+      int lowInd = lowIt - y.begin();
+      int upInd  = upIt - y.begin();
+
+      tmp = (x.size() - (upInd - lowInd));
+      stat += tmp;
+
+   }
+   int factor =  pow(x.size(), 2);
+   stat /= factor;
+
+   // printf("Stat: %f \n", stat);
+
+   return stat;
+}
 
 bool initializeOutputFile(long C, long M, long N, const ArgumentParser &args, ofstream *outF, ofstream outFiles[]){//{{{
    if(args.flag("samples")){
@@ -256,12 +310,22 @@ bool initializeOutputFile(long C, long M, long N, const ArgumentParser &args, of
    for(long c=0;c<C;c++)
       for(long c2=c+1;c2<C;c2++)
       *outF<<c+1<<"~"<<c2+1<<" ";
-   *outF<<"\n# Columns contain PPLR for each pair of conditions, "
+   if(args.getD("logFCThreshold")>0.0){
+      *outF<<"\n# Columns contain PPLR for each pair of conditions, "
+          "a probability of the logged fold-change being bigger than the cut-off value ("<<args.getD("logFCThreshold")<<"), "
           "log2 fold change with confidence intervals for each pair of conditions and "
           "log mean condition mean expression for each condition.\n"
           "# CPxPPLR CPx(log2FC ConfidenceLow ConfidenceHigh) "
           "Cx(log mean condition mean expressions)"
         <<endl;
+   }else{
+      *outF<<"\n# Columns contain PPLR for each pair of conditions, "
+          "log2 fold change with confidence intervals for each pair of conditions and "
+          "log mean condition mean expression for each condition.\n"
+          "# CPxPPLR CPx(log2FC ConfidenceLow ConfidenceHigh) "
+          "Cx(log mean condition mean expressions)"
+        <<endl;
+   }
    return true;
 }//}}}
 
